@@ -3,6 +3,7 @@ import re
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List
@@ -11,8 +12,6 @@ import google.generativeai as genai
 import edge_tts
 from pydub import AudioSegment
 from pydub.effects import compress_dynamic_range, high_pass_filter
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
 from tqdm.asyncio import tqdm
 
 # Load environment variables
@@ -240,6 +239,7 @@ class AudioBookGenerator:
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-2.5-flash')
         self.audio_processor = CinematicAudioProcessor()
+        self.last_generated_segments = []
 
     def calculate_target_words(self, duration: int) -> int:
         return int(duration * 165)
@@ -249,26 +249,31 @@ class AudioBookGenerator:
         available_sounds = list(self.audio_processor.ambience_files.keys())
         
         # Support chunked generation for long durations
-        if duration > 5:
+        if duration > 15:
             logger.info(f"Long duration ({duration} min) detected, using chunked generation")
             return await self._generate_chunked_content(topic, duration, emotion, available_sounds)
         else:
-            return await self._generate_single_chunk(topic, duration, emotion, available_sounds, 0.0)
+            return await self._generate_single_chunk(topic, duration, emotion, available_sounds, 0.0, False, None)
     
-    async def _generate_single_chunk(self, topic: str, duration: int, emotion: str, available_sounds: List[str], start_offset: float) -> List[NarrationSegment]:
+    async def _generate_single_chunk(self, topic: str, duration: int, emotion: str, available_sounds: List[str], start_offset: float, is_continuation: bool = False, previous_context: str = None) -> List[NarrationSegment]:
         """Generate a single chunk of content"""
         word_count = self.calculate_target_words(duration)
         
         logger.info(f"Generating chunk - Target: {word_count} words, Duration: {duration} min")
         
-        prompt = f"""You are an expert audiobook producer. Create a structured audiobook script about "{topic}" with specific audio cues.
+        if is_continuation and previous_context:
+            continuation_instruction = f"\n\nIMPORTANT: This is a CONTINUATION of an existing audiobook. The previous section ended with: '{previous_context}'. Continue the narrative naturally from where it left off. DO NOT repeat the introduction or restart the story."
+        else:
+            continuation_instruction = ""
+        
+        prompt = f"""You are an expert audiobook producer. Create a structured audiobook script about "{topic}" with specific audio cues.{continuation_instruction}
 
 AVAILABLE AUDIO FILES: {available_sounds}
 
 Requirements:
 1. Target: ~{word_count} words (±5%) for {duration} minutes
 2. Emotion: {emotion}
-3. Create 3-4 narrative segments
+3. Create 8-12 narrative segments
 4. Each segment should specify which audio file to use as background
 
 Return ONLY a JSON array with this exact structure:
@@ -288,7 +293,7 @@ Rules:
 - Match audio to the scene content
 - Ensure segments flow naturally
 - Total duration should be approximately {duration * 60} seconds
-- Each segment text should be substantial (50-200 words)
+- Each segment text should be concise (25-75 words)
 - Start_time of next segment = end_time of previous segment"""
 
         # Retry logic with exponential backoff
@@ -336,13 +341,14 @@ Rules:
     
     async def _generate_chunked_content(self, topic: str, total_duration: int, emotion: str, available_sounds: List[str]) -> List[NarrationSegment]:
         """Generate content in chunks for long durations"""
-        chunk_size = 5  # 5 minutes per chunk
+        chunk_size = 8  # 8 minutes per chunk
         chunks_needed = (total_duration + chunk_size - 1) // chunk_size  # Ceiling division
         
         logger.info(f"Generating {chunks_needed} chunks of {chunk_size} minutes each")
         
         all_segments = []
         current_start_time = 0.0
+        previous_context = None
         
         for chunk_idx in range(chunks_needed):
             # Calculate duration for this chunk
@@ -351,13 +357,21 @@ Rules:
             
             logger.info(f"Generating chunk {chunk_idx + 1}/{chunks_needed} (duration: {chunk_duration} min)")
             
+            # Determine if this is a continuation
+            is_continuation = chunk_idx > 0
+            
             # Generate chunk
             chunk_segments = await self._generate_single_chunk(
-                topic, chunk_duration, emotion, available_sounds, current_start_time
+                topic, chunk_duration, emotion, available_sounds, current_start_time, is_continuation, previous_context
             )
-            
+            print(chunk_segments)
             # Adjust timing for subsequent chunks
             if chunk_segments:
+                # Extract context from last segment for next chunk
+                last_segment_text = chunk_segments[-1].text
+                words = last_segment_text.split()
+                previous_context = ' '.join(words[-15:])  # Last 15 words as context
+                
                 # Update start time for next chunk
                 current_start_time = chunk_segments[-1].end_time
                 all_segments.extend(chunk_segments)
@@ -475,6 +489,7 @@ Rules:
             # Generate structured content
             logger.info("📝 Generating structured content with Gemini...")
             segments = await self.generate_structured_content(topic, duration, emotion)
+            print(segments)
             logger.info(f"✅ Generated {len(segments)} segments")
             
             # File paths
@@ -501,6 +516,9 @@ Rules:
             if os.path.exists(narration_path):
                 os.remove(narration_path)
             
+            # Store segments for API access
+            self.last_generated_segments = segments
+            
             logger.info(f"🎉 Audiobook '{topic}' completed successfully!")
             return {
                 'success': True,
@@ -517,39 +535,6 @@ Rules:
             logger.error(f"Audiobook creation failed: {e}")
             return {'success': False, 'error': str(e)}
 
-# FastAPI Application
-app = FastAPI(title="Structured Audio Book Generator")
-
-@app.post("/generate-audiobook")
-async def generate_audiobook_endpoint(request_data: dict):
-    try:
-        topic = request_data.get('topic')
-        duration = request_data.get('duration', 10)
-        emotion = request_data.get('emotion', 'neutral')
-        api_key = request_data.get('api_key')
-        
-        if not topic:
-            raise HTTPException(status_code=400, detail="Topic is required")
-        
-        def create_audiobook_sync():
-            generator = AudioBookGenerator(api_key)
-            return asyncio.run(generator.create_audiobook(topic, duration, emotion))
-        
-        result = await asyncio.to_thread(create_audiobook_sync)
-        
-        if not result['success']:
-            raise HTTPException(status_code=500, detail=result['error'])
-        
-        return FileResponse(
-            path=result['audio_path'],
-            media_type='audio/mpeg',
-            filename=f"{topic.replace(' ', '_')}_audiobook.mp3"
-        )
-        
-    except Exception as e:
-        logger.error(f"API error: {e}")
-        return {"error": str(e)}
-
 # CLI Usage
 async def main():
     try:
@@ -561,11 +546,22 @@ async def main():
         duration = int(input("Enter duration in minutes (default 10): ") or 10)
         emotion = input("Enter emotion (cheerful/serious/mystery/neutral, default neutral): ") or 'neutral'
         
+        # Start timer
+        start_time = time.time()
+        print(f"\n⏱️ Starting generation at {time.strftime('%H:%M:%S')}...")
+        
         generator = AudioBookGenerator(api_key)
         result = await generator.create_audiobook(topic, duration, emotion)
         
+        # Calculate generation time
+        end_time = time.time()
+        generation_time = end_time - start_time
+        minutes = int(generation_time // 60)
+        seconds = int(generation_time % 60)
+        
         if result['success']:
             print(f"\n✅ Structured audiobook generated!")
+            print(f"⏱️ Generation time: {minutes}m {seconds}s")
             print(f"Topic: {result['topic']}")
             print(f"Emotion: {result['emotion']}")
             print(f"Segments: {result['segments']}")
@@ -577,6 +573,7 @@ async def main():
                 os.startfile(result['audio_path'])
         else:
             print(f"❌ Error: {result['error']}")
+            print(f"⏱️ Failed after: {minutes}m {seconds}s")
             
     except Exception as e:
         logger.error(f"CLI error: {e}")

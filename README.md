@@ -10,7 +10,7 @@ Generate professional-quality audiobooks with intelligent background ambience us
 - **⚡ Parallel Processing**: Simultaneous segment generation for speed
 - **🎚️ Professional Audio**: Dynamic ducking, compression, and EQ
 - **🔄 Chunked Generation**: Handles long durations without timeouts
-- **🌐 Dual Interface**: CLI and REST API support
+- **🖥️ CLI Interface**: Simple command-line interface
 
 ## 🚀 Quick Start
 
@@ -53,21 +53,7 @@ python audio_book_gen.py
 # - Emotion: serious/cheerful/mystery/neutral
 ```
 
-### API Interface
-```bash
-# Start server
-uvicorn audio_book_gen:app --host 0.0.0.0 --port 8000
 
-# Generate audiobook
-curl -X POST "http://localhost:8000/generate-audiobook" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "topic": "Ancient Egyptian Mysteries",
-    "duration": 10,
-    "emotion": "mystery",
-    "api_key": "your_gemini_api_key"
-  }'
-```
 
 ## 🎭 Emotion Voices
 
@@ -169,7 +155,7 @@ audio_book_generator/
 - **AI Content**: Google Gemini 2.5 Flash
 - **Voice Synthesis**: Microsoft Edge TTS
 - **Audio Processing**: pydub + FFmpeg
-- **Web Framework**: FastAPI
+
 - **Async Processing**: asyncio + tqdm
 - **Environment**: python-dotenv
 
